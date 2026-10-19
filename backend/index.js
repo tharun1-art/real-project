@@ -1,11 +1,25 @@
 
 const express = require('express');
 const pool = require('./db');
+const redisClient = require('./redis');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const CACHE_KEY = 'currency:rates:INR';
+const CACHE_TTL_SECONDS = 60;
 
 app.use(express.json({ limit: '10kb' }));
+
+// Connect to Redis. The API can still start if Redis is unavailable.
+async function connectRedis() {
+  try {
+    if (!redisClient.isOpen) {
+      await redisClient.connect();
+    }
+  } catch (err) {
+    console.error('Redis connection unavailable:', err.message);
+  }
+}
 
 // Health check: verifies that the API process is running.
 app.get('/health', (req, res) => {
@@ -15,9 +29,25 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Return active INR exchange rates from MySQL.
+// Return active INR exchange rates, using Redis as a cache.
 app.get('/api/rates', async (req, res, next) => {
   try {
+    if (redisClient.isReady) {
+      try {
+        const cachedRates = await redisClient.get(CACHE_KEY);
+
+        if (cachedRates !== null) {
+          return res.json({
+            ...JSON.parse(cachedRates),
+            cache: 'HIT'
+          });
+        }
+      } catch (err) {
+        console.error('Redis cache read failed:', err.message);
+      }
+    }
+
+    // Cache miss or Redis unavailable: read from MySQL.
     const [rows] = await pool.execute(
       `SELECT er.target_currency, er.rate, er.source, er.updated_at
        FROM exchange_rates AS er
@@ -38,12 +68,28 @@ app.get('/api/rates', async (req, res, next) => {
 
     const sources = [...new Set(rows.map(row => row.source))];
 
-    return res.json({
+    const response = {
       base: 'INR',
       source: sources.length === 1 ? sources[0] : sources,
       rates,
       updatedAt: rows.length ? rows[0].updated_at : null,
       disclaimer: 'Rates are illustrative, not live exchange rates'
+    };
+
+    // Cache writes are best-effort. MySQL remains the source of truth.
+    if (redisClient.isReady) {
+      try {
+        await redisClient.set(CACHE_KEY, JSON.stringify(response), {
+          EX: CACHE_TTL_SECONDS
+        });
+      } catch (err) {
+        console.error('Redis cache write failed:', err.message);
+      }
+    }
+
+    return res.json({
+      ...response,
+      cache: 'MISS'
     });
   } catch (err) {
     return next(err);
@@ -134,6 +180,12 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`Currency Exchange API listening on port ${PORT}`);
-});
+async function startServer() {
+  await connectRedis();
+
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`Currency Exchange API listening on port ${PORT}`);
+  });
+}
+
+startServer();
